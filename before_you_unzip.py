@@ -5,17 +5,18 @@ Version 0.1.0
 
 A local, read-only ZIP archive inspection utility.
 
-The tool inspects archive structure and metadata without extracting
-or executing archive contents.
+Inspect first. Decide second. Extract later.
 
-It is not antivirus software and does not declare archives safe.
+Before You Unzip examines ZIP structure and metadata without
+extracting or executing archive contents.
+
+This is not antivirus software and does not declare archives safe.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import struct
 import sys
 import zipfile
@@ -45,7 +46,7 @@ DEFAULT_COMPRESSION_RATIO_WARNING = 100.0
 
 
 # ---------------------------------------------------------------------
-# Known archive types
+# File classifications
 # ---------------------------------------------------------------------
 
 ARCHIVE_EXTENSIONS = {
@@ -60,25 +61,36 @@ ARCHIVE_EXTENSIONS = {
 }
 
 
-# ---------------------------------------------------------------------
-# File types that deserve attention
+# Code / scripting files.
 #
-# Presence does NOT imply malware.
-# ---------------------------------------------------------------------
+# Their presence is informational context.
+# They are not treated the same as native binary executables.
+SCRIPT_CODE_EXTENSIONS = {
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ps1",
+    ".sh",
+    ".bat",
+    ".cmd",
+    ".vbs",
+    ".py",
+    ".rb",
+    ".pl",
+    ".php",
+}
 
-POTENTIALLY_EXECUTABLE_EXTENSIONS = {
+
+# File types capable of representing native/program executable content.
+#
+# Presence still does NOT imply maliciousness.
+BINARY_EXECUTABLE_EXTENSIONS = {
     ".exe",
     ".dll",
     ".com",
     ".scr",
     ".msi",
-    ".bat",
-    ".cmd",
-    ".ps1",
-    ".vbs",
-    ".js",
     ".jar",
-    ".sh",
 }
 
 
@@ -95,9 +107,16 @@ KNOWN_COMPRESSION_METHODS = {
 # ---------------------------------------------------------------------
 
 def human_bytes(value: int) -> str:
-    """Convert bytes to a readable representation."""
+    """Convert bytes into a human-readable string."""
 
-    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    units = [
+        "B",
+        "KiB",
+        "MiB",
+        "GiB",
+        "TiB",
+        "PiB",
+    ]
 
     size = float(value)
 
@@ -116,7 +135,7 @@ def human_bytes(value: int) -> str:
 
 
 def extension_for(filename: str) -> str:
-    """Return a lowercase file extension."""
+    """Return lowercase suffix or [none]."""
 
     suffix = PurePosixPath(filename).suffix.lower()
 
@@ -126,6 +145,7 @@ def extension_for(filename: str) -> str:
 def valid_zip_timestamp(
     timestamp: tuple[int, int, int, int, int, int]
 ) -> bool:
+    """Check whether a ZIP timestamp represents a valid date/time."""
 
     try:
         datetime(*timestamp)
@@ -137,23 +157,24 @@ def valid_zip_timestamp(
 
 def suspicious_path(filename: str) -> bool:
     """
-    Detect obvious archive path traversal / absolute-path indicators.
+    Detect obvious traversal or absolute-path indicators.
 
-    This does not extract anything.
+    No extraction occurs.
     """
 
     normalized = filename.replace("\\", "/")
 
     path = PurePosixPath(normalized)
 
+    # Unix-style absolute path.
     if path.is_absolute():
         return True
 
+    # Parent traversal.
     if ".." in path.parts:
         return True
 
-    # Windows drive path:
-    # C:/Windows/...
+    # Windows drive path: C:/...
     if (
         len(normalized) >= 3
         and normalized[1] == ":"
@@ -168,7 +189,8 @@ def make_finding(
     severity: str,
     category: str,
     message: str,
-    entry: str | None = None,
+    count: int | None = None,
+    entries: list[str] | None = None,
 ) -> dict[str, Any]:
 
     result: dict[str, Any] = {
@@ -177,14 +199,17 @@ def make_finding(
         "message": message,
     }
 
-    if entry is not None:
-        result["entry"] = entry
+    if count is not None:
+        result["count"] = count
+
+    if entries:
+        result["entries"] = entries
 
     return result
 
 
 # ---------------------------------------------------------------------
-# ZIP local-header inspection
+# Local ZIP header inspection
 # ---------------------------------------------------------------------
 
 def inspect_local_header(
@@ -192,10 +217,8 @@ def inspect_local_header(
     info: zipfile.ZipInfo,
     archive_size: int,
 ) -> list[str]:
-
     """
-    Compare selected local-header fields against information from
-    the central directory.
+    Compare selected local-header fields against the central directory.
 
     No decompression is performed.
     """
@@ -244,7 +267,6 @@ def inspect_local_header(
         ]
 
     if signature != LOCAL_FILE_HEADER_SIGNATURE:
-
         return [
             "Invalid local file header signature."
         ]
@@ -268,7 +290,7 @@ def inspect_local_header(
 
     filename_bytes = raw_file.read(filename_length)
 
-    # Move past the extra field.
+    # Skip the extra field.
     raw_file.read(extra_length)
 
     # UTF-8 filename flag.
@@ -292,10 +314,7 @@ def inspect_local_header(
                 "the filename is not valid UTF-8."
             )
 
-    # Bit 3 indicates use of a data descriptor.
-    #
-    # In this situation CRC and sizes in the local
-    # header may legitimately contain placeholders.
+    # Bit 3 indicates a data descriptor may contain CRC/sizes later.
     uses_data_descriptor = bool(flags & 0x08)
 
     if not uses_data_descriptor:
@@ -307,7 +326,7 @@ def inspect_local_header(
                 "local header and central directory."
             )
 
-        # ZIP64 commonly uses 0xFFFFFFFF placeholders.
+        # ZIP64 may use 0xFFFFFFFF placeholders.
         if (
             compressed_size != 0xFFFFFFFF
             and compressed_size != info.compress_size
@@ -332,13 +351,14 @@ def inspect_local_header(
 
 
 # ---------------------------------------------------------------------
-# Inspection
+# Archive inspection
 # ---------------------------------------------------------------------
 
 def inspect_zip(
     archive_path: Path,
     *,
-    include_entry_names: bool = True,
+    public_report: bool = False,
+    verbose: bool = False,
     max_entries: int = DEFAULT_MAX_ENTRIES,
     ratio_warning: float = DEFAULT_COMPRESSION_RATIO_WARNING,
 ) -> dict[str, Any]:
@@ -346,21 +366,16 @@ def inspect_zip(
     archive_size = archive_path.stat().st_size
 
     report: dict[str, Any] = {
-
         "tool": APP_NAME,
         "version": VERSION,
-
         "archive": archive_path.name,
-
         "archive_size_bytes": archive_size,
         "archive_size": human_bytes(archive_size),
-
         "summary": {},
-
         "file_types": {},
-
+        "script_code_types": {},
+        "binary_executable_types": {},
         "findings": [],
-
         "notes": [
             "No files were extracted.",
             "No files were executed.",
@@ -382,6 +397,35 @@ def inspect_zip(
 
             total_entries = len(infos)
 
+            file_count = 0
+            directory_count = 0
+
+            total_compressed = 0
+            total_uncompressed = 0
+
+            extension_counts: Counter[str] = Counter()
+
+            script_counts: Counter[str] = Counter()
+            binary_counts: Counter[str] = Counter()
+
+            encrypted_entries: list[str] = []
+            nested_entries: list[str] = []
+            suspicious_entries: list[str] = []
+            high_ratio_entries: list[str] = []
+            metadata_entries: list[str] = []
+
+            metadata_messages: Counter[str] = Counter()
+
+            duplicate_names: list[str] = []
+
+            seen_names: Counter[str] = Counter()
+
+            unknown_compression_entries: list[str] = []
+
+            # -----------------------------------------------------
+            # Entry count
+            # -----------------------------------------------------
+
             if total_entries > max_entries:
 
                 findings.append(
@@ -393,26 +437,13 @@ def inspect_zip(
                             f"above the configured review threshold "
                             f"of {max_entries:,}."
                         ),
+                        count=total_entries,
                     )
                 )
 
-            file_count = 0
-            directory_count = 0
-
-            encrypted_count = 0
-            nested_archive_count = 0
-            executable_type_count = 0
-
-            suspicious_path_count = 0
-            metadata_finding_count = 0
-            high_ratio_count = 0
-
-            total_compressed = 0
-            total_uncompressed = 0
-
-            extensions: Counter[str] = Counter()
-
-            seen_names: Counter[str] = Counter()
+            # -----------------------------------------------------
+            # Per-entry inspection
+            # -----------------------------------------------------
 
             for info in infos:
 
@@ -423,114 +454,51 @@ def inspect_zip(
                 if info.is_dir():
 
                     directory_count += 1
-
                     continue
 
                 file_count += 1
 
                 total_compressed += info.compress_size
-
                 total_uncompressed += info.file_size
 
                 extension = extension_for(name)
 
-                extensions[extension] += 1
+                extension_counts[extension] += 1
 
+                # -------------------------------------------------
+                # Script / code classification
+                # -------------------------------------------------
+
+                if extension in SCRIPT_CODE_EXTENSIONS:
+                    script_counts[extension] += 1
+
+                # -------------------------------------------------
+                # Binary executable classification
+                # -------------------------------------------------
+
+                if extension in BINARY_EXECUTABLE_EXTENSIONS:
+                    binary_counts[extension] += 1
 
                 # -------------------------------------------------
                 # Encryption
                 # -------------------------------------------------
 
                 if bool(info.flag_bits & 0x1):
-
-                    encrypted_count += 1
-
-                    findings.append(
-                        make_finding(
-                            "info",
-                            "encryption",
-                            "Encrypted archive entry detected.",
-                            (
-                                name
-                                if include_entry_names
-                                else None
-                            ),
-                        )
-                    )
-
+                    encrypted_entries.append(name)
 
                 # -------------------------------------------------
-                # Nested archive
+                # Nested archives
                 # -------------------------------------------------
 
                 if extension in ARCHIVE_EXTENSIONS:
-
-                    nested_archive_count += 1
-
-                    findings.append(
-                        make_finding(
-                            "info",
-                            "nested_archive",
-                            "Nested archive detected.",
-                            (
-                                name
-                                if include_entry_names
-                                else None
-                            ),
-                        )
-                    )
-
+                    nested_entries.append(name)
 
                 # -------------------------------------------------
-                # Potential executable/script
-                # -------------------------------------------------
-
-                if extension in POTENTIALLY_EXECUTABLE_EXTENSIONS:
-
-                    executable_type_count += 1
-
-                    findings.append(
-                        make_finding(
-                            "warning",
-                            "file_type",
-                            (
-                                "Potentially executable or "
-                                "script-like file type detected "
-                                f"({extension})."
-                            ),
-                            (
-                                name
-                                if include_entry_names
-                                else None
-                            ),
-                        )
-                    )
-
-
-                # -------------------------------------------------
-                # Path traversal
+                # Suspicious paths
                 # -------------------------------------------------
 
                 if suspicious_path(name):
-
-                    suspicious_path_count += 1
-
-                    findings.append(
-                        make_finding(
-                            "warning",
-                            "path",
-                            (
-                                "Suspicious archive path detected "
-                                "(possible traversal or absolute path)."
-                            ),
-                            (
-                                name
-                                if include_entry_names
-                                else None
-                            ),
-                        )
-                    )
-
+                    suspicious_entries.append(name)
 
                 # -------------------------------------------------
                 # Timestamp
@@ -538,48 +506,18 @@ def inspect_zip(
 
                 if not valid_zip_timestamp(info.date_time):
 
-                    metadata_finding_count += 1
+                    metadata_entries.append(name)
 
-                    findings.append(
-                        make_finding(
-                            "warning",
-                            "metadata",
-                            (
-                                "Invalid or impossible ZIP "
-                                "timestamp detected."
-                            ),
-                            (
-                                name
-                                if include_entry_names
-                                else None
-                            ),
-                        )
-                    )
-
+                    metadata_messages[
+                        "Invalid or impossible ZIP timestamp detected."
+                    ] += 1
 
                 # -------------------------------------------------
                 # Compression method
                 # -------------------------------------------------
 
                 if info.compress_type not in KNOWN_COMPRESSION_METHODS:
-
-                    findings.append(
-                        make_finding(
-                            "info",
-                            "compression",
-                            (
-                                "Unknown or unsupported "
-                                "compression method: "
-                                f"{info.compress_type}"
-                            ),
-                            (
-                                name
-                                if include_entry_names
-                                else None
-                            ),
-                        )
-                    )
-
+                    unknown_compression_entries.append(name)
 
                 # -------------------------------------------------
                 # Compression ratio
@@ -593,49 +531,14 @@ def inspect_zip(
                     )
 
                     if ratio > ratio_warning:
-
-                        high_ratio_count += 1
-
-                        findings.append(
-                            make_finding(
-                                "warning",
-                                "compression_ratio",
-                                (
-                                    "High compression ratio detected "
-                                    f"({ratio:.2f}x)."
-                                ),
-                                (
-                                    name
-                                    if include_entry_names
-                                    else None
-                                ),
-                            )
-                        )
+                        high_ratio_entries.append(name)
 
                 elif info.file_size > 0:
 
-                    high_ratio_count += 1
-
-                    findings.append(
-                        make_finding(
-                            "warning",
-                            "compression_ratio",
-                            (
-                                "Entry declares non-zero "
-                                "uncompressed data while "
-                                "compressed size is zero."
-                            ),
-                            (
-                                name
-                                if include_entry_names
-                                else None
-                            ),
-                        )
-                    )
-
+                    high_ratio_entries.append(name)
 
                 # -------------------------------------------------
-                # Local header consistency
+                # Header consistency
                 # -------------------------------------------------
 
                 header_issues = inspect_local_header(
@@ -646,57 +549,21 @@ def inspect_zip(
 
                 for issue in header_issues:
 
-                    metadata_finding_count += 1
-
-                    findings.append(
-                        make_finding(
-                            "warning",
-                            "metadata",
-                            issue,
-                            (
-                                name
-                                if include_entry_names
-                                else None
-                            ),
-                        )
-                    )
-
+                    metadata_entries.append(name)
+                    metadata_messages[issue] += 1
 
             # -----------------------------------------------------
             # Duplicate names
             # -----------------------------------------------------
 
             duplicate_names = [
-
                 name
-
-                for name, count
-                in seen_names.items()
-
+                for name, count in seen_names.items()
                 if count > 1
             ]
 
-            for name in duplicate_names:
-
-                findings.append(
-                    make_finding(
-                        "warning",
-                        "duplicate",
-                        (
-                            "Duplicate archive entry name "
-                            f"detected ({seen_names[name]} occurrences)."
-                        ),
-                        (
-                            name
-                            if include_entry_names
-                            else None
-                        ),
-                    )
-                )
-
-
             # -----------------------------------------------------
-            # Overall expansion ratio
+            # Overall ratio
             # -----------------------------------------------------
 
             overall_ratio = None
@@ -708,56 +575,284 @@ def inspect_zip(
                     / total_compressed
                 )
 
-                if overall_ratio > ratio_warning:
+            # -----------------------------------------------------
+            # Aggregated findings
+            # -----------------------------------------------------
 
-                    findings.append(
-                        make_finding(
-                            "warning",
-                            "compression_ratio",
-                            (
-                                "Archive-wide compression ratio "
-                                f"is high ({overall_ratio:.2f}x)."
-                            ),
+            if script_counts:
+
+                total_scripts = sum(script_counts.values())
+
+                entries = None
+
+                if verbose and not public_report:
+
+                    entries = [
+                        info.filename
+                        for info in infos
+                        if (
+                            not info.is_dir()
+                            and extension_for(info.filename)
+                            in SCRIPT_CODE_EXTENSIONS
                         )
-                    )
+                    ]
 
+                findings.append(
+                    make_finding(
+                        "info",
+                        "script_code",
+                        (
+                            f"{total_scripts:,} script/code "
+                            f"file entries detected."
+                        ),
+                        count=total_scripts,
+                        entries=entries,
+                    )
+                )
+
+            if binary_counts:
+
+                total_binaries = sum(binary_counts.values())
+
+                entries = None
+
+                if verbose and not public_report:
+
+                    entries = [
+                        info.filename
+                        for info in infos
+                        if (
+                            not info.is_dir()
+                            and extension_for(info.filename)
+                            in BINARY_EXECUTABLE_EXTENSIONS
+                        )
+                    ]
+
+                findings.append(
+                    make_finding(
+                        "warning",
+                        "binary_executable",
+                        (
+                            f"{total_binaries:,} executable/binary "
+                            f"file entries detected."
+                        ),
+                        count=total_binaries,
+                        entries=entries,
+                    )
+                )
+
+            if encrypted_entries:
+
+                findings.append(
+                    make_finding(
+                        "info",
+                        "encryption",
+                        (
+                            f"{len(encrypted_entries):,} encrypted "
+                            f"archive entries detected."
+                        ),
+                        count=len(encrypted_entries),
+                        entries=(
+                            encrypted_entries
+                            if verbose and not public_report
+                            else None
+                        ),
+                    )
+                )
+
+            if nested_entries:
+
+                findings.append(
+                    make_finding(
+                        "info",
+                        "nested_archive",
+                        (
+                            f"{len(nested_entries):,} nested "
+                            f"archive entries detected."
+                        ),
+                        count=len(nested_entries),
+                        entries=(
+                            nested_entries
+                            if verbose and not public_report
+                            else None
+                        ),
+                    )
+                )
+
+            if suspicious_entries:
+
+                findings.append(
+                    make_finding(
+                        "warning",
+                        "path",
+                        (
+                            f"{len(suspicious_entries):,} suspicious "
+                            f"archive paths detected."
+                        ),
+                        count=len(suspicious_entries),
+                        entries=(
+                            suspicious_entries
+                            if verbose and not public_report
+                            else None
+                        ),
+                    )
+                )
+
+            if duplicate_names:
+
+                findings.append(
+                    make_finding(
+                        "warning",
+                        "duplicate",
+                        (
+                            f"{len(duplicate_names):,} duplicate "
+                            f"archive entry names detected."
+                        ),
+                        count=len(duplicate_names),
+                        entries=(
+                            duplicate_names
+                            if verbose and not public_report
+                            else None
+                        ),
+                    )
+                )
+
+            if metadata_entries:
+
+                unique_metadata_entries = list(
+                    dict.fromkeys(metadata_entries)
+                )
+
+                findings.append(
+                    make_finding(
+                        "warning",
+                        "metadata",
+                        (
+                            f"{len(unique_metadata_entries):,} entries "
+                            f"have metadata/header findings."
+                        ),
+                        count=len(unique_metadata_entries),
+                        entries=(
+                            unique_metadata_entries
+                            if verbose and not public_report
+                            else None
+                        ),
+                    )
+                )
+
+            if unknown_compression_entries:
+
+                findings.append(
+                    make_finding(
+                        "info",
+                        "compression_method",
+                        (
+                            f"{len(unknown_compression_entries):,} entries "
+                            f"use unknown or unsupported "
+                            f"compression methods."
+                        ),
+                        count=len(unknown_compression_entries),
+                        entries=(
+                            unknown_compression_entries
+                            if verbose and not public_report
+                            else None
+                        ),
+                    )
+                )
+
+            if high_ratio_entries:
+
+                findings.append(
+                    make_finding(
+                        "warning",
+                        "compression_ratio",
+                        (
+                            f"{len(high_ratio_entries):,} entries exceed "
+                            f"the configured compression-ratio review "
+                            f"threshold of {ratio_warning:g}x."
+                        ),
+                        count=len(high_ratio_entries),
+                        entries=(
+                            high_ratio_entries
+                            if verbose and not public_report
+                            else None
+                        ),
+                    )
+                )
+
+            if (
+                overall_ratio is not None
+                and overall_ratio > ratio_warning
+            ):
+
+                findings.append(
+                    make_finding(
+                        "warning",
+                        "archive_compression_ratio",
+                        (
+                            "Archive-wide compression ratio "
+                            f"is high ({overall_ratio:.2f}x)."
+                        ),
+                    )
+                )
 
             # -----------------------------------------------------
-            # Summary
+            # Report data
             # -----------------------------------------------------
 
             report["file_types"] = dict(
-                sorted(
-                    extensions.items()
-                )
+                sorted(extension_counts.items())
+            )
+
+            report["script_code_types"] = dict(
+                sorted(script_counts.items())
+            )
+
+            report["binary_executable_types"] = dict(
+                sorted(binary_counts.items())
+            )
+
+            report["metadata_issue_types"] = dict(
+                metadata_messages
             )
 
             report["summary"] = {
-
                 "entries": total_entries,
-
                 "files": file_count,
-
                 "directories": directory_count,
 
-                "encrypted_entries": encrypted_count,
+                "script_code_entries":
+                    sum(script_counts.values()),
 
-                "nested_archives": nested_archive_count,
+                "binary_executable_entries":
+                    sum(binary_counts.values()),
 
-                "potentially_executable_file_types":
-                    executable_type_count,
+                "encrypted_entries":
+                    len(encrypted_entries),
+
+                "nested_archives":
+                    len(nested_entries),
 
                 "suspicious_paths":
-                    suspicious_path_count,
+                    len(suspicious_entries),
 
                 "duplicate_names":
                     len(duplicate_names),
 
                 "metadata_findings":
-                    metadata_finding_count,
+                    len(
+                        list(
+                            dict.fromkeys(
+                                metadata_entries
+                            )
+                        )
+                    ),
+
+                "unknown_compression_methods":
+                    len(unknown_compression_entries),
 
                 "high_compression_ratio_entries":
-                    high_ratio_count,
+                    len(high_ratio_entries),
 
                 "compressed_size_bytes":
                     total_compressed,
@@ -797,24 +892,23 @@ def inspect_zip(
 
 
 # ---------------------------------------------------------------------
-# CLI output
+# CLI report
 # ---------------------------------------------------------------------
 
 def print_report(
     report: dict[str, Any],
+    *,
+    verbose: bool = False,
 ) -> None:
 
     summary = report["summary"]
-
     findings = report["findings"]
 
     print()
-
     print(
         f"{APP_NAME} v{report['version']}"
     )
-
-    print("=" * 64)
+    print("=" * 68)
 
     print(
         f"Archive:                  "
@@ -846,9 +940,7 @@ def print_report(
         f"{summary['uncompressed_size']}"
     )
 
-    ratio = summary[
-        "overall_compression_ratio"
-    ]
+    ratio = summary["overall_compression_ratio"]
 
     if ratio is None:
 
@@ -863,92 +955,131 @@ def print_report(
             f"{ratio:.2f}x"
         )
 
+    # -----------------------------------------------------------------
+    # Main checks
+    # -----------------------------------------------------------------
 
     print()
-
-    print(
-        "Archive-level checks"
-    )
-
-    print("-" * 64)
-
+    print("Archive-level checks")
+    print("-" * 68)
 
     checks = [
-
         (
             "Encrypted entries",
-            summary[
-                "encrypted_entries"
-            ],
+            summary["encrypted_entries"],
+            "info",
         ),
-
         (
             "Nested archives",
-            summary[
-                "nested_archives"
-            ],
+            summary["nested_archives"],
+            "info",
         ),
-
         (
-            "Executable/script-like types",
-            summary[
-                "potentially_executable_file_types"
-            ],
+            "Script/code entries",
+            summary["script_code_entries"],
+            "info",
         ),
-
+        (
+            "Executable/binary entries",
+            summary["binary_executable_entries"],
+            "warning",
+        ),
         (
             "Suspicious paths",
-            summary[
-                "suspicious_paths"
-            ],
+            summary["suspicious_paths"],
+            "warning",
         ),
-
         (
             "Duplicate names",
-            summary[
-                "duplicate_names"
-            ],
+            summary["duplicate_names"],
+            "warning",
         ),
-
         (
             "Metadata findings",
-            summary[
-                "metadata_findings"
-            ],
+            summary["metadata_findings"],
+            "warning",
         ),
-
         (
             "High compression-ratio entries",
-            summary[
-                "high_compression_ratio_entries"
-            ],
+            summary["high_compression_ratio_entries"],
+            "warning",
         ),
     ]
 
+    for label, value, finding_type in checks:
 
-    for label, value in checks:
+        if value == 0:
+            marker = "✓"
 
-        marker = (
-            "!"
-            if value
-            else "✓"
-        )
+        elif finding_type == "info":
+            marker = "i"
+
+        else:
+            marker = "!"
 
         print(
             f"{marker} "
-            f"{label:<38} "
-            f"{value}"
+            f"{label:<40} "
+            f"{value:,}"
         )
 
+    # -----------------------------------------------------------------
+    # Code/script summary
+    # -----------------------------------------------------------------
+
+    if report["script_code_types"]:
+
+        print()
+        print("Script / code types")
+        print("-" * 68)
+
+        for extension, count in report[
+            "script_code_types"
+        ].items():
+
+            print(
+                f"{extension:<16} "
+                f"{count:,}"
+            )
+
+        print()
+        print(
+            "Note: script/code files can contain executable logic, "
+            "but their presence alone does not indicate malicious content."
+        )
+
+    # -----------------------------------------------------------------
+    # Binary executable summary
+    # -----------------------------------------------------------------
+
+    if report["binary_executable_types"]:
+
+        print()
+        print("Executable / binary types")
+        print("-" * 68)
+
+        for extension, count in report[
+            "binary_executable_types"
+        ].items():
+
+            print(
+                f"{extension:<16} "
+                f"{count:,}"
+            )
+
+        print()
+        print(
+            "Executable or binary file types deserve review, "
+            "but their presence alone is not a malware verdict."
+        )
+
+    # -----------------------------------------------------------------
+    # General file types
+    # -----------------------------------------------------------------
 
     print()
-
-    print(
-        "File types"
-    )
-
-    print("-" * 64)
-
+    print("File types")
+    print("-" * 68)
 
     if report["file_types"]:
 
@@ -958,7 +1089,7 @@ def print_report(
 
             print(
                 f"{extension:<16} "
-                f"{count}"
+                f"{count:,}"
             )
 
     else:
@@ -967,21 +1098,18 @@ def print_report(
             "No file entries found."
         )
 
+    # -----------------------------------------------------------------
+    # Findings
+    # -----------------------------------------------------------------
 
     print()
-
-    print(
-        "Findings"
-    )
-
-    print("-" * 64)
-
+    print("Findings")
+    print("-" * 68)
 
     if not findings:
 
         print(
-            "No obvious archive-level "
-            "warnings were found."
+            "No obvious archive-level warnings were found."
         )
 
     else:
@@ -990,33 +1118,83 @@ def print_report(
 
             marker = (
                 "!"
-                if item["severity"]
-                == "warning"
+                if item["severity"] == "warning"
                 else "i"
             )
 
-            entry = ""
-
-            if "entry" in item:
-
-                entry = (
-                    f" [{item['entry']}]"
-                )
-
             print(
-                f"{marker} "
-                f"{item['message']}"
-                f"{entry}"
+                f"{marker} {item['message']}"
             )
 
+            if verbose and item.get("entries"):
+
+                for entry in item["entries"]:
+                    print(
+                        f"    - {entry}"
+                    )
+
+    # -----------------------------------------------------------------
+    # Summary interpretation
+    # -----------------------------------------------------------------
 
     print()
+    print("Archive posture")
+    print("-" * 68)
 
-    print(
-        "Important"
-    )
+    if summary["metadata_findings"] == 0:
+        print(
+            "Structural metadata:      No obvious issues"
+        )
+    else:
+        print(
+            "Structural metadata:      Review findings"
+        )
 
-    print("-" * 64)
+    if summary["suspicious_paths"] == 0:
+        print(
+            "Path handling:            No obvious issues"
+        )
+    else:
+        print(
+            "Path handling:            Review findings"
+        )
+
+    if summary["high_compression_ratio_entries"] == 0:
+        print(
+            "Expansion behaviour:      No obvious ratio warnings"
+        )
+    else:
+        print(
+            "Expansion behaviour:      Review findings"
+        )
+
+    if summary["binary_executable_entries"] == 0:
+        print(
+            "Binary executables:       None detected by extension"
+        )
+    else:
+        print(
+            f"Binary executables:       "
+            f"{summary['binary_executable_entries']:,} detected"
+        )
+
+    if summary["script_code_entries"] == 0:
+        print(
+            "Script/code entries:      None detected"
+        )
+    else:
+        print(
+            f"Script/code entries:      "
+            f"{summary['script_code_entries']:,} detected"
+        )
+
+    # -----------------------------------------------------------------
+    # Important footer
+    # -----------------------------------------------------------------
+
+    print()
+    print("Important")
+    print("-" * 68)
 
     print(
         "No files extracted."
@@ -1033,115 +1211,86 @@ def print_report(
     )
 
     print(
-        "Further scanning may still "
-        "be appropriate."
+        "Further scanning may still be appropriate."
     )
 
     print()
 
 
 # ---------------------------------------------------------------------
-# Argument parser
+# Arguments
 # ---------------------------------------------------------------------
 
 def parse_arguments() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
-
         prog="before-you-unzip",
-
         description=(
             "Inspect ZIP structure and metadata "
             "before unpacking the archive."
         ),
     )
 
-
     parser.add_argument(
-
         "archive",
-
         type=Path,
-
-        help=(
-            "Path to the ZIP archive."
-        ),
+        help="Path to the ZIP archive.",
     )
 
-
     parser.add_argument(
-
         "--json",
-
         dest="json_path",
-
         type=Path,
-
         help=(
             "Write inspection results "
             "to a JSON report."
         ),
     )
 
-
     parser.add_argument(
-
         "--public-report",
-
         action="store_true",
-
         help=(
-            "Hide individual archive "
-            "entry names from findings."
+            "Hide individual archive-entry names "
+            "from detailed output."
         ),
     )
 
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Show individual archive-entry names "
+            "for findings."
+        ),
+    )
 
     parser.add_argument(
-
         "--max-entries",
-
         type=int,
-
         default=DEFAULT_MAX_ENTRIES,
-
         help=(
             "Entry-count review threshold. "
-            f"Default: "
-            f"{DEFAULT_MAX_ENTRIES:,}"
+            f"Default: {DEFAULT_MAX_ENTRIES:,}"
         ),
     )
 
-
     parser.add_argument(
-
         "--ratio-warning",
-
         type=float,
-
-        default=
-            DEFAULT_COMPRESSION_RATIO_WARNING,
-
+        default=DEFAULT_COMPRESSION_RATIO_WARNING,
         help=(
-            "Compression ratio warning "
-            "threshold. "
+            "Compression ratio review threshold. "
             f"Default: "
             f"{DEFAULT_COMPRESSION_RATIO_WARNING:g}x"
         ),
     )
 
-
     parser.add_argument(
-
         "--version",
-
         action="version",
-
-        version=(
-            f"%(prog)s {VERSION}"
-        ),
+        version=f"%(prog)s {VERSION}",
     )
-
 
     return parser.parse_args()
 
@@ -1157,31 +1306,26 @@ def main() -> int:
     if args.max_entries < 1:
 
         print(
-            "Error: --max-entries "
-            "must be greater than zero.",
+            "Error: --max-entries must be greater than zero.",
             file=sys.stderr,
         )
 
         return 2
-
 
     if args.ratio_warning <= 0:
 
         print(
-            "Error: --ratio-warning "
-            "must be greater than zero.",
+            "Error: --ratio-warning must be greater than zero.",
             file=sys.stderr,
         )
 
         return 2
-
 
     archive_path = (
         args.archive
         .expanduser()
         .resolve()
     )
-
 
     if not archive_path.exists():
 
@@ -1193,7 +1337,6 @@ def main() -> int:
 
         return 2
 
-
     if not archive_path.is_file():
 
         print(
@@ -1203,7 +1346,6 @@ def main() -> int:
         )
 
         return 2
-
 
     if not zipfile.is_zipfile(
         archive_path
@@ -1217,24 +1359,15 @@ def main() -> int:
 
         return 2
 
-
     try:
 
         report = inspect_zip(
-
             archive_path,
-
-            include_entry_names=(
-                not args.public_report
-            ),
-
-            max_entries=
-                args.max_entries,
-
-            ratio_warning=
-                args.ratio_warning,
+            public_report=args.public_report,
+            verbose=args.verbose,
+            max_entries=args.max_entries,
+            ratio_warning=args.ratio_warning,
         )
-
 
     except (
         OSError,
@@ -1251,11 +1384,13 @@ def main() -> int:
 
         return 1
 
-
     print_report(
-        report
+        report,
+        verbose=(
+            args.verbose
+            and not args.public_report
+        ),
     )
-
 
     if args.json_path:
 
@@ -1265,13 +1400,12 @@ def main() -> int:
             .resolve()
         )
 
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-
         try:
+
+            output_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
             with open(
                 output_path,
@@ -1288,7 +1422,6 @@ def main() -> int:
 
                 handle.write("\n")
 
-
         except OSError as exc:
 
             print(
@@ -1299,12 +1432,10 @@ def main() -> int:
 
             return 1
 
-
         print(
             f"JSON report written to: "
             f"{output_path}"
         )
-
 
     return 0
 
