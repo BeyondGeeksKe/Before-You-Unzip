@@ -1170,21 +1170,21 @@ def print_report(
 
     if summary["binary_executable_entries"] == 0:
         print(
-            "Binary executables:       None detected by extension"
+            "Executable/binary types:       None detected by extension"
         )
     else:
         print(
-            f"Binary executables:       "
+            f"Executable/binary types:       "
             f"{summary['binary_executable_entries']:,} detected"
         )
 
     if summary["script_code_entries"] == 0:
         print(
-            "Script/code entries:      None detected"
+            "Script/code types:       None detected"
         )
     else:
         print(
-            f"Script/code entries:      "
+            f"Script/code types:      "
             f"{summary['script_code_entries']:,} detected"
         )
 
